@@ -9,17 +9,26 @@ export class QuotaExceededError extends Error {
   }
 }
 
-export async function getBackgroundPrompt(pageText: string): Promise<string> {
+export async function getBackgroundPrompt(pageText: string, iteration: number = 1): Promise<string> {
   try {
     const response = await ai.models.generateContent({
       model: "gemini-3-flash-preview",
-      contents: `Analyze the following text from a book page and describe a subtle, atmospheric, and artistic background image that matches the mood. 
-      The description should be for an image generation model. 
-      IMPORTANT: The image should be "atmospheric" and "artistic" with a balanced color palette that matches the mood, but remains subtle enough to not distract from reading text on top of it.
+      contents: `Analyze the following text from a book page and describe a highly detailed, cinematic, and artistic background image that captures the core essence and atmosphere of the scene. 
       
-      Text: ${pageText.substring(0, 2000)}
+      ${iteration > 1 ? "This is a REFINEMENT. Make the previous concept more vivid, focusing on lighting, texture, and emotional depth." : ""}
       
-      Return ONLY the image prompt.`,
+      The description should be optimized for a high-end image generation model (like FLUX or Imagen). 
+      Focus on:
+      - Lighting (e.g., "golden hour glow", "moody chiaroscuro", "ethereal bioluminescence")
+      - Style (e.g., "painterly impressionism", "hyper-realistic digital art", "vintage storybook illustration")
+      - Composition (e.g., "wide angle landscape", "intimate close-up with bokeh")
+      - Color Palette: Suggest colors that match the emotional tone.
+      
+      IMPORTANT: The image should be "atmospheric" and "artistic" but remain subtle enough to serve as a background for reading.
+      
+      Text: ${pageText.substring(0, 2500)}
+      
+      Return ONLY the descriptive image prompt.`,
     });
     
     return response.text || "A subtle greyish atmospheric minimalist background";
