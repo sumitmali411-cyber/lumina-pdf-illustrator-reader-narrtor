@@ -9,7 +9,7 @@ export class QuotaExceededError extends Error {
   }
 }
 
-export async function getBackgroundPrompt(pageText: string, iteration: number = 1): Promise<string> {
+export async function getBackgroundPrompt(pageText: string, iteration: number = 1, style: string = 'Cinematic'): Promise<string> {
   try {
     const response = await ai.models.generateContent({
       model: "gemini-3-flash-preview",
@@ -20,7 +20,7 @@ export async function getBackgroundPrompt(pageText: string, iteration: number = 
       The description should be optimized for a high-end image generation model (like FLUX or Imagen). 
       Focus on:
       - Lighting (e.g., "golden hour glow", "moody chiaroscuro", "ethereal bioluminescence")
-      - Style (e.g., "painterly impressionism", "hyper-realistic digital art", "vintage storybook illustration")
+      - Style: The requested artistic style is "${style}". Ensure the prompt reflects this specific style.
       - Composition (e.g., "wide angle landscape", "intimate close-up with bokeh")
       - Color Palette: Suggest colors that match the emotional tone.
       
@@ -40,14 +40,27 @@ export async function getBackgroundPrompt(pageText: string, iteration: number = 
   }
 }
 
-export async function generateBackgroundImage(prompt: string): Promise<string | null> {
+export async function summarizeText(text: string): Promise<string | null> {
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-3-flash-preview",
+      contents: `Summarize the following text from a book page concisely in 2-3 sentences. Capture the main events, ideas, or mood:\n\n${text.substring(0, 3000)}`
+    });
+    return response.text || null;
+  } catch (error) {
+    console.error("Summarization failed:", error);
+    return null;
+  }
+}
+
+export async function generateBackgroundImage(prompt: string, negativePrompt?: string): Promise<string | null> {
   try {
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash-image',
       contents: {
         parts: [
           {
-            text: `${prompt}. Atmospheric, artistic, high key, soft focus, ethereal, high quality digital art.`,
+            text: `${prompt}. Atmospheric, artistic, high key, soft focus, ethereal, high quality digital art.${negativePrompt ? ` DO NOT INCLUDE: ${negativePrompt}` : ''}`,
           },
         ],
       },
@@ -75,11 +88,11 @@ export async function generateBackgroundImage(prompt: string): Promise<string | 
   }
 }
 
-export async function generateSpeech(text: string, voice: 'Kore' | 'Fenrir' | 'Zephyr' = 'Kore'): Promise<string | null> {
+export async function generateSpeechPCM(text: string, voice: 'Kore' | 'Fenrir' | 'Zephyr' = 'Kore'): Promise<Uint8Array | null> {
   try {
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash-preview-tts",
-      contents: [{ parts: [{ text: `Read this book page with a professional and immersive voice: ${text.substring(0, 1000)}` }] }],
+      contents: [{ parts: [{ text: text }] }],
       config: {
         responseModalities: [Modality.AUDIO],
         speechConfig: {
@@ -92,13 +105,75 @@ export async function generateSpeech(text: string, voice: 'Kore' | 'Fenrir' | 'Z
 
     const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     if (base64Audio) {
-      // Gemini TTS returns raw PCM 16-bit, 24kHz. 
-      // We need to wrap it in a WAV header for the browser to play it.
-      const pcmData = Uint8Array.from(atob(base64Audio), c => c.charCodeAt(0));
-      const wavHeader = createWavHeader(pcmData.length, 24000);
-      const wavData = new Uint8Array(wavHeader.length + pcmData.length);
+      return Uint8Array.from(atob(base64Audio), c => c.charCodeAt(0));
+    }
+    return null;
+  } catch (error: any) {
+    if (error?.message?.includes("429") || error?.message?.toLowerCase().includes("quota")) {
+      throw new QuotaExceededError("API quota reached");
+    }
+    console.error("Speech generation failed:", error);
+    return null;
+  }
+}
+
+export async function generateSpeech(text: string, voice: 'Kore' | 'Fenrir' | 'Zephyr' = 'Kore'): Promise<string | null> {
+  try {
+    const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+    const allTextChunks: string[] = [];
+    let currentChunk = "";
+    
+    for (const sentence of sentences) {
+      if (currentChunk.length + sentence.length > 500) {
+        if (currentChunk.trim()) allTextChunks.push(currentChunk.trim());
+        currentChunk = sentence;
+      } else {
+        currentChunk += " " + sentence;
+      }
+    }
+    if (currentChunk.trim()) allTextChunks.push(currentChunk.trim());
+
+    const pcmChunks: Uint8Array[] = [];
+    let totalPcmLength = 0;
+
+    for (let i = 0; i < allTextChunks.length; i++) {
+      const chunkText = allTextChunks[i];
+      if (!chunkText) continue;
+
+      let pcmData: Uint8Array | null = null;
+      let retries = 3;
+      while (retries > 0 && !pcmData) {
+        try {
+          pcmData = await generateSpeechPCM(`Read this text with a professional and immersive voice: ${chunkText}`, voice);
+          if (!pcmData) throw new Error("Null PCM data");
+        } catch (err) {
+          retries--;
+          if (retries === 0) {
+            console.warn(`Failed to generate speech for chunk ${i}`);
+          } else {
+            await new Promise(r => setTimeout(r, 2000));
+          }
+        }
+      }
+
+      if (pcmData) {
+        pcmChunks.push(pcmData);
+        totalPcmLength += pcmData.length;
+      }
+      
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    if (pcmChunks.length > 0) {
+      const wavHeader = createWavHeader(totalPcmLength, 24000);
+      const wavData = new Uint8Array(wavHeader.length + totalPcmLength);
       wavData.set(wavHeader);
-      wavData.set(pcmData, wavHeader.length);
+      
+      let offset = wavHeader.length;
+      for (const pcm of pcmChunks) {
+        wavData.set(pcm, offset);
+        offset += pcm.length;
+      }
       
       const blob = new Blob([wavData], { type: 'audio/wav' });
       return URL.createObjectURL(blob);
@@ -110,7 +185,7 @@ export async function generateSpeech(text: string, voice: 'Kore' | 'Fenrir' | 'Z
   }
 }
 
-function createWavHeader(dataLength: number, sampleRate: number): Uint8Array {
+export function createWavHeader(dataLength: number, sampleRate: number): Uint8Array {
   const header = new ArrayBuffer(44);
   const view = new DataView(header);
 

@@ -5,7 +5,7 @@
 
 const HF_TOKEN = process.env.VITE_HUGGINGFACE_TOKEN || "";
 
-export async function generateOpenImage(prompt: string): Promise<string | null> {
+export async function generateOpenImage(prompt: string, negativePrompt?: string): Promise<string | null> {
   try {
     // Using FLUX.1-schnell (Open Weight)
     const model = "black-forest-labs/FLUX.1-schnell";
@@ -17,7 +17,7 @@ export async function generateOpenImage(prompt: string): Promise<string | null> 
           "Content-Type": "application/json",
         },
         method: "POST",
-        body: JSON.stringify({ inputs: `${prompt}. Atmospheric, artistic, ethereal, soft focus.` }),
+        body: JSON.stringify({ inputs: `${prompt}. Atmospheric, artistic, ethereal, soft focus.${negativePrompt ? ` DO NOT INCLUDE: ${negativePrompt}` : ''}` }),
       }
     );
 

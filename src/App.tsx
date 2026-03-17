@@ -1,8 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
-import { Upload, BookOpen, ChevronLeft, ChevronRight, Loader2, Sparkles, Download, Play, Pause, Volume2, X, HelpCircle, Menu, Settings, Info, History, Layers } from 'lucide-react';
+import { Upload, BookOpen, ChevronLeft, ChevronRight, Loader2, Sparkles, Download, Play, Pause, Volume2, X, HelpCircle, Menu, Settings, Info, History, Layers, Moon, Sun, Type, FileText } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { getBackgroundPrompt, generateBackgroundImage, generateSpeech, QuotaExceededError } from './services/geminiService';
+import { getBackgroundPrompt, generateBackgroundImage, generateSpeech, generateSpeechPCM, createWavHeader, QuotaExceededError, summarizeText } from './services/geminiService';
 import { generateOpenImage, generateOpenSpeech } from './services/openSourceService';
 import { offlineSpeech } from './services/offlineSpeechService';
 import OfflineBackground from './components/OfflineBackground';
@@ -12,6 +12,8 @@ import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { jsPDF } from 'jspdf';
 import confetti from 'canvas-confetti';
+import JSZip from 'jszip';
+import { Document, Packer, Paragraph, TextRun, ImageRun } from 'docx';
 
 // Utility for tailwind classes
 function cn(...inputs: ClassValue[]) {
@@ -27,6 +29,8 @@ interface PageData {
   audioUrl: string | null;
   loading: boolean;
   audioLoading: boolean;
+  summary?: string | null;
+  summaryLoading?: boolean;
 }
 
 export default function App() {
@@ -39,8 +43,8 @@ export default function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState({ completed: 0, total: 0 });
-  const [backgroundProgress, setBackgroundProgress] = useState({ completed: 0, total: 0 });
-  const [isBackgroundProcessing, setIsBackgroundProcessing] = useState(false);
+  const [isExportingAudiobook, setIsExportingAudiobook] = useState(false);
+  const [audiobookProgress, setAudiobookProgress] = useState({ completed: 0, total: 0 });
   const [currentWordIndex, setCurrentWordIndex] = useState<number>(-1);
   const [isIllustrationDisabled, setIsIllustrationDisabled] = useState(false);
   const [showQuotaWarning, setShowQuotaWarning] = useState(false);
@@ -48,12 +52,28 @@ export default function App() {
   const [provider, setProvider] = useState<'gemini' | 'open-source' | 'offline'>('gemini');
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isMobile, setIsMobile] = useState(false);
+  const [autoPlayNext, setAutoPlayNext] = useState(false);
+  const [voice, setVoice] = useState<'Kore' | 'Fenrir' | 'Zephyr'>('Kore');
+  const [artStyle, setArtStyle] = useState<string>('Cinematic');
+  const [pageHistory, setPageHistory] = useState<number[]>([]);
+  const [fontFamily, setFontFamily] = useState<string>('font-sans');
+  const [fontSize, setFontSize] = useState<string>('text-lg md:text-2xl');
+  const [darkMode, setDarkMode] = useState<boolean>(true);
+  const [negativePrompt, setNegativePrompt] = useState<string>('');
+  const [isAutoPlayEnabled, setIsAutoPlayEnabled] = useState<boolean>(true);
+  const [speechRate, setSpeechRate] = useState<number>(1);
+  const [customPronunciations, setCustomPronunciations] = useState<{word: string, pronunciation: string}[]>([]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const renderTaskRef = useRef<any>(null);
   const loadingPagesRef = useRef<Set<number>>(new Set());
+  const currentPageRef = useRef(currentPage);
+
+  useEffect(() => {
+    currentPageRef.current = currentPage;
+  }, [currentPage]);
 
   useEffect(() => {
     const checkMobile = () => {
@@ -74,8 +94,6 @@ export default function App() {
     setCurrentPage(1);
     setNumPages(0);
     setIsPlaying(false);
-    setBackgroundProgress({ completed: 0, total: 0 });
-    setIsBackgroundProcessing(false);
   };
 
   const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -86,7 +104,6 @@ export default function App() {
       setCurrentPage(1);
       setPagesData({});
       setIsPlaying(false);
-      setBackgroundProgress({ completed: 0, total: 0 });
       
       try {
         const arrayBuffer = await selectedFile.arrayBuffer();
@@ -94,8 +111,6 @@ export default function App() {
         const pdf = await loadingTask.promise;
         setPdfDoc(pdf);
         setNumPages(pdf.numPages);
-        setBackgroundProgress({ completed: 0, total: pdf.numPages });
-        startBackgroundGeneration(pdf);
       } catch (error) {
         console.error("Error loading PDF:", error);
       } finally {
@@ -104,54 +119,16 @@ export default function App() {
     }
   };
 
-  const startBackgroundGeneration = async (doc: pdfjsLib.PDFDocumentProxy) => {
-    setIsBackgroundProcessing(true);
-    const total = doc.numPages;
-    
-    // Process pages in chunks or sequentially to avoid rate limits
-    for (let i = 1; i <= total; i++) {
-      // If app was reset or file changed, stop
-      if (!doc) break;
-      
-      // If page already has image, skip
-      if (pagesData[i]?.imageUrl) {
-        setBackgroundProgress(prev => ({ ...prev, completed: i }));
-        continue;
-      }
-
-      try {
-        await loadPageData(i, doc, true);
-        setBackgroundProgress(prev => ({ ...prev, completed: i }));
-      } catch (err) {
-        console.error(`Background generation failed for page ${i}`, err);
-      }
-      
-      // Small delay to be kind to the API
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
-    setIsBackgroundProcessing(false);
-  };
-
-  const loadPageData = async (pageNum: number, doc: pdfjsLib.PDFDocumentProxy, isBackground = false) => {
-    // If it's a background task and we already have the image, skip
-    if (isBackground && pagesData[pageNum]?.imageUrl) return;
-    
-    // If it's the current page and we already have the image, just render and return
-    if (!isBackground && pagesData[pageNum]?.imageUrl) {
-      const page = await doc.getPage(pageNum);
-      await renderToCanvas(page);
-      return;
-    }
-
+  const loadPageData = async (pageNum: number, doc: pdfjsLib.PDFDocumentProxy) => {
     // Prevent concurrent loads of the same page
     if (loadingPagesRef.current.has(pageNum)) return;
     loadingPagesRef.current.add(pageNum);
 
     // Don't set loading state if it's a background task for a different page
-    if (!isBackground || pageNum === currentPage) {
+    if (pageNum === currentPage) {
       setPagesData(prev => ({
         ...prev,
-        [pageNum]: { ...prev[pageNum], loading: true, audioLoading: false, audioUrl: null, text: prev[pageNum]?.text || '', imageUrl: prev[pageNum]?.imageUrl || null }
+        [pageNum]: { ...prev[pageNum], loading: false, audioLoading: false, audioUrl: null, text: prev[pageNum]?.text || '', imageUrl: prev[pageNum]?.imageUrl || null }
       }));
     }
 
@@ -173,48 +150,12 @@ export default function App() {
           [pageNum]: { ...prev[pageNum], text }
         }));
       }
-
-      // Skip illustration if disabled
-      if (isIllustrationDisabled) {
-        setPagesData(prev => ({
-          ...prev,
-          [pageNum]: { ...prev[pageNum], loading: false }
-        }));
-        return;
-      }
-
-      // Get background prompt from Gemini
-      const prompt = await getBackgroundPrompt(text);
-      
-      // Generate background image
-      let imageUrl = null;
-      if (provider === 'gemini') {
-        imageUrl = await generateBackgroundImage(prompt);
-      } else {
-        imageUrl = await generateOpenImage(prompt);
-      }
-
+    } catch (error) {
+      console.error(`Error loading page ${pageNum}:`, error);
       setPagesData(prev => ({
         ...prev,
-        [pageNum]: { ...prev[pageNum], imageUrl, loading: false }
+        [pageNum]: { ...prev[pageNum], text: 'Error loading page content.', imageUrl: null, loading: false }
       }));
-    } catch (error) {
-      if (error instanceof QuotaExceededError) {
-        console.warn("Illustration limit reached. Switching to offline mode.");
-        setIsIllustrationDisabled(true);
-        setPagesData(prev => ({
-          ...prev,
-          [pageNum]: { ...prev[pageNum], loading: false }
-        }));
-        return;
-      }
-      console.error(`Error loading page ${pageNum}:`, error);
-      if (!isBackground) {
-        setPagesData(prev => ({
-          ...prev,
-          [pageNum]: { ...prev[pageNum], text: 'Error loading page content.', imageUrl: null, loading: false }
-        }));
-      }
     } finally {
       loadingPagesRef.current.delete(pageNum);
     }
@@ -235,16 +176,27 @@ export default function App() {
 
       renderInProgressRef.current = true;
 
-      const viewport = page.getViewport({ scale: 1.5 });
+      const scale = 1.5;
+      const viewport = page.getViewport({ scale });
       const canvas = canvasRef.current;
       const context = canvas.getContext('2d');
       
-      canvas.height = viewport.height;
-      canvas.width = viewport.width;
+      const outputScale = window.devicePixelRatio || 1;
+
+      canvas.width = Math.floor(viewport.width * outputScale);
+      canvas.height = Math.floor(viewport.height * outputScale);
+      canvas.style.width = "100%";
+      canvas.style.maxWidth = Math.floor(viewport.width) + "px";
+      canvas.style.height = "auto";
+
+      const transform = outputScale !== 1
+        ? [outputScale, 0, 0, outputScale, 0, 0]
+        : null;
 
       if (context) {
         const renderContext: any = {
           canvasContext: context,
+          transform: transform,
           viewport: viewport,
         };
         
@@ -267,6 +219,50 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    if (currentPage > 0) {
+      setPageHistory(prev => {
+        if (prev[prev.length - 1] === currentPage) return prev;
+        const newHistory = [...prev, currentPage];
+        if (newHistory.length > 10) newHistory.shift();
+        return newHistory;
+      });
+    }
+  }, [currentPage]);
+
+  const handleSummarize = async () => {
+    const currentData = pagesData[currentPage];
+    if (!currentData || !currentData.text) return;
+
+    setPagesData(prev => ({
+      ...prev,
+      [currentPage]: { ...prev[currentPage], summaryLoading: true }
+    }));
+
+    const summary = await summarizeText(currentData.text);
+
+    setPagesData(prev => ({
+      ...prev,
+      [currentPage]: { ...prev[currentPage], summary, summaryLoading: false }
+    }));
+  };
+
+  const applyPronunciations = (text: string) => {
+    let result = text;
+    for (const { word, pronunciation } of customPronunciations) {
+      if (word && pronunciation) {
+        try {
+          const escapedWord = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const regex = new RegExp(`\\b${escapedWord}\\b`, 'gi');
+          result = result.replace(regex, pronunciation);
+        } catch (e) {
+          // Ignore invalid regex
+        }
+      }
+    }
+    return result;
+  };
+
   const handleNarrate = async () => {
     const currentData = pagesData[currentPage];
     if (!currentData || !currentData.text) return;
@@ -278,11 +274,20 @@ export default function App() {
         setCurrentWordIndex(-1);
       } else {
         setIsPlaying(true);
-        offlineSpeech.speak(currentData.text, {
+        offlineSpeech.speak(applyPronunciations(currentData.text), {
+          rate: speechRate,
           onBoundary: (index) => setCurrentWordIndex(index),
           onEnd: () => {
             setIsPlaying(false);
             setCurrentWordIndex(-1);
+            if (isAutoPlayEnabled && currentPage < numPages) {
+              setAutoPlayNext(true);
+              setCurrentPage(prev => {
+                const next = prev + 1;
+                if (next === numPages) triggerConfetti();
+                return next;
+              });
+            }
           },
           onError: () => {
             setIsPlaying(false);
@@ -298,39 +303,53 @@ export default function App() {
         audioRef.current?.pause();
         setIsPlaying(false);
       } else {
-        audioRef.current?.play();
-        setIsPlaying(true);
+        setTimeout(() => {
+          if (audioRef.current) {
+            audioRef.current.playbackRate = speechRate;
+            audioRef.current.play().catch(e => console.error("Playback failed:", e));
+            setIsPlaying(true);
+            if (audioRef.current.currentTime === 0) {
+              setCurrentWordIndex(0);
+            }
+          }
+        }, 50);
       }
       return;
     }
 
-    setCurrentWordIndex(0);
     setPagesData(prev => ({
       ...prev,
       [currentPage]: { ...prev[currentPage], audioLoading: true }
     }));
 
+    const requestedPage = currentPage;
+
     let audioUrl = null;
+    const textToSpeak = applyPronunciations(currentData.text);
     if (provider === 'gemini') {
-      audioUrl = await generateSpeech(currentData.text);
+      audioUrl = await generateSpeech(textToSpeak, voice);
     } else {
-      audioUrl = await generateOpenSpeech(currentData.text);
+      audioUrl = await generateOpenSpeech(textToSpeak);
     }
     
     setPagesData(prev => ({
       ...prev,
-      [currentPage]: { ...prev[currentPage], audioUrl, audioLoading: false }
+      [requestedPage]: { ...prev[requestedPage], audioUrl, audioLoading: false }
     }));
 
     if (audioUrl) {
       setTimeout(() => {
-        audioRef.current?.play();
-        setIsPlaying(true);
+        if (audioRef.current && currentPageRef.current === requestedPage) {
+          audioRef.current.playbackRate = speechRate;
+          audioRef.current.play().catch(e => console.error("Playback failed:", e));
+          setIsPlaying(true);
+          setCurrentWordIndex(0);
+        }
       }, 100);
     }
   };
 
-  const handleRefreshIllustration = async () => {
+  const handleGenerateIllustration = async () => {
     if (!pdfDoc || isExporting) return;
     
     setPagesData(prev => ({
@@ -338,8 +357,40 @@ export default function App() {
       [currentPage]: { ...prev[currentPage], loading: true, imageUrl: null }
     }));
     
-    setIsIllustrationDisabled(false); // Try to re-enable if it was disabled
-    await loadPageData(currentPage, pdfDoc);
+    setIsIllustrationDisabled(false);
+
+    try {
+      let text = pagesData[currentPage]?.text;
+      if (!text) {
+        const page = await pdfDoc.getPage(currentPage);
+        const textContent = await page.getTextContent();
+        text = textContent.items.map((item: any) => item.str).join(' ');
+      }
+
+      const prompt = await getBackgroundPrompt(text, 1, artStyle);
+      let imageUrl = null;
+      if (provider === 'gemini') {
+        imageUrl = await generateBackgroundImage(prompt, negativePrompt);
+      } else {
+        imageUrl = await generateOpenImage(prompt, negativePrompt);
+      }
+
+      setPagesData(prev => ({
+        ...prev,
+        [currentPage]: { ...prev[currentPage], imageUrl, loading: false }
+      }));
+    } catch (error) {
+      if (error instanceof QuotaExceededError) {
+        console.warn("Illustration limit reached.");
+        setIsIllustrationDisabled(true);
+      } else {
+        console.error(`Error generating illustration for page ${currentPage}:`, error);
+      }
+      setPagesData(prev => ({
+        ...prev,
+        [currentPage]: { ...prev[currentPage], loading: false }
+      }));
+    }
   };
 
   const triggerConfetti = () => {
@@ -360,6 +411,112 @@ export default function App() {
       confetti({ ...defaults, particleCount, origin: { x: randomInRange(0.1, 0.3), y: Math.random() - 0.2 } });
       confetti({ ...defaults, particleCount, origin: { x: randomInRange(0.7, 0.9), y: Math.random() - 0.2 } });
     }, 250);
+  };
+
+  const exportAudiobook = async () => {
+    if (!pdfDoc || !file) return;
+    setIsExportingAudiobook(true);
+    
+    try {
+      const allTextChunks: string[] = [];
+      setAudiobookProgress({ completed: 0, total: numPages });
+      
+      for (let i = 1; i <= numPages; i++) {
+        let text = pagesData[i]?.text;
+        if (!text) {
+          const page = await pdfDoc.getPage(i);
+          const textContent = await page.getTextContent();
+          text = textContent.items.map((item: any) => item.str).join(' ');
+        }
+        
+        text = applyPronunciations(text);
+        
+        const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+        let currentChunk = "";
+        
+        for (const sentence of sentences) {
+          if (currentChunk.length + sentence.length > 500) {
+            if (currentChunk.trim()) allTextChunks.push(currentChunk.trim());
+            currentChunk = sentence;
+          } else {
+            currentChunk += " " + sentence;
+          }
+        }
+        if (currentChunk.trim()) allTextChunks.push(currentChunk.trim());
+        
+        setAudiobookProgress(prev => ({ ...prev, completed: i }));
+      }
+
+      setAudiobookProgress({ completed: 0, total: allTextChunks.length });
+      
+      const pcmChunks: Uint8Array[] = [];
+      let totalPcmLength = 0;
+      
+      for (let i = 0; i < allTextChunks.length; i++) {
+        const chunkText = allTextChunks[i];
+        if (!chunkText) {
+          setAudiobookProgress(prev => ({ ...prev, completed: i + 1 }));
+          continue;
+        }
+        
+        let pcmData: Uint8Array | null = null;
+        let retries = 3;
+        while (retries > 0 && !pcmData) {
+          try {
+            pcmData = await generateSpeechPCM(`Read this text with a professional and immersive voice: ${chunkText}`, voice);
+            if (!pcmData) throw new Error("Null PCM data");
+          } catch (err) {
+            retries--;
+            if (retries === 0) {
+              console.warn(`Failed to generate speech for chunk ${i}`);
+            } else {
+              await new Promise(r => setTimeout(r, 2000));
+            }
+          }
+        }
+        
+        if (pcmData) {
+          pcmChunks.push(pcmData);
+          totalPcmLength += pcmData.length;
+        }
+        
+        setAudiobookProgress(prev => ({ ...prev, completed: i + 1 }));
+        await new Promise(r => setTimeout(r, 500));
+      }
+      
+      if (pcmChunks.length > 0) {
+        const wavHeader = createWavHeader(totalPcmLength, 24000);
+        const wavData = new Uint8Array(wavHeader.length + totalPcmLength);
+        wavData.set(wavHeader);
+        
+        let offset = wavHeader.length;
+        for (const pcm of pcmChunks) {
+          wavData.set(pcm, offset);
+          offset += pcm.length;
+        }
+        
+        const blob = new Blob([wavData], { type: 'audio/wav' });
+        const url = URL.createObjectURL(blob);
+        
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${file.name.replace('.pdf', '')}_audiobook.wav`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        triggerConfetti();
+      } else {
+        alert("Failed to generate audiobook. Please try again later.");
+      }
+      
+    } catch (error) {
+      console.error("Audiobook export failed:", error);
+      alert("An error occurred while exporting the audiobook.");
+    } finally {
+      setIsExportingAudiobook(false);
+    }
   };
 
   const exportWithBackgrounds = async () => {
@@ -386,8 +543,8 @@ export default function App() {
             let imageUrl: string | null = null;
             if (!isIllustrationDisabled) {
               try {
-                const prompt = await getBackgroundPrompt(text);
-                imageUrl = await generateBackgroundImage(prompt);
+                const prompt = await getBackgroundPrompt(text, 1, artStyle);
+                imageUrl = await generateBackgroundImage(prompt, negativePrompt);
               } catch (error) {
                 if (error instanceof QuotaExceededError) {
                   setIsIllustrationDisabled(true);
@@ -466,6 +623,179 @@ export default function App() {
     }
   };
 
+  const exportEpub = async () => {
+    if (!pdfDoc || !file) return;
+    setIsExporting(true);
+    setExportProgress({ completed: 0, total: numPages });
+
+    try {
+      const zip = new JSZip();
+      
+      zip.file("mimetype", "application/epub+zip");
+      
+      const metaInf = zip.folder("META-INF");
+      metaInf?.file("container.xml", `<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>`);
+
+      const oebps = zip.folder("OEBPS");
+      
+      let manifestItems = '';
+      let spineItems = '';
+      
+      for (let i = 1; i <= numPages; i++) {
+        setExportProgress(prev => ({ ...prev, completed: i }));
+        let pageData = pagesData[i];
+        let text = pageData?.text;
+        let imageUrl = pageData?.imageUrl;
+
+        if (!text) {
+          const page = await pdfDoc.getPage(i);
+          const textContent = await page.getTextContent();
+          text = textContent.items.map((item: any) => item.str).join(' ');
+        }
+
+        if (!imageUrl && !isIllustrationDisabled) {
+          try {
+            const prompt = await getBackgroundPrompt(text, 1, artStyle);
+            imageUrl = await generateBackgroundImage(prompt, negativePrompt);
+          } catch (e) {
+            imageUrl = null;
+          }
+        }
+
+        let imageHtml = '';
+        if (imageUrl) {
+          const base64Data = imageUrl.split(',')[1];
+          oebps?.file(`image_${i}.jpg`, base64Data, {base64: true});
+          manifestItems += `<item id="img_${i}" href="image_${i}.jpg" media-type="image/jpeg"/>\n`;
+          imageHtml = `<img src="image_${i}.jpg" alt="Illustration for page ${i}" style="max-width: 100%;"/>`;
+        }
+
+        const htmlContent = `<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Page ${i}</title></head>
+<body>
+  ${imageHtml}
+  <p>${text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</p>
+</body>
+</html>`;
+        
+        oebps?.file(`page_${i}.xhtml`, htmlContent);
+        manifestItems += `<item id="page_${i}" href="page_${i}.xhtml" media-type="application/xhtml+xml"/>\n`;
+        spineItems += `<itemref idref="page_${i}"/>\n`;
+      }
+
+      const contentOpf = `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>${file.name.replace('.pdf', '')}</dc:title>
+    <dc:language>en</dc:language>
+    <dc:identifier id="BookId">urn:uuid:12345</dc:identifier>
+  </metadata>
+  <manifest>
+    ${manifestItems}
+  </manifest>
+  <spine>
+    ${spineItems}
+  </spine>
+</package>`;
+
+      oebps?.file("content.opf", contentOpf);
+
+      const content = await zip.generateAsync({ type: "blob" });
+      const url = URL.createObjectURL(content);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${file.name.replace('.pdf', '')}.epub`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+    } catch (error) {
+      console.error("EPUB export failed:", error);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const exportDocx = async () => {
+    if (!pdfDoc || !file) return;
+    setIsExporting(true);
+    setExportProgress({ completed: 0, total: numPages });
+
+    try {
+      const children: any[] = [];
+
+      for (let i = 1; i <= numPages; i++) {
+        setExportProgress(prev => ({ ...prev, completed: i }));
+        let pageData = pagesData[i];
+        let text = pageData?.text;
+        let imageUrl = pageData?.imageUrl;
+
+        if (!text) {
+          const page = await pdfDoc.getPage(i);
+          const textContent = await page.getTextContent();
+          text = textContent.items.map((item: any) => item.str).join(' ');
+        }
+
+        if (!imageUrl && !isIllustrationDisabled) {
+          try {
+            const prompt = await getBackgroundPrompt(text, 1, artStyle);
+            imageUrl = await generateBackgroundImage(prompt, negativePrompt);
+          } catch (e) {
+            imageUrl = null;
+          }
+        }
+
+        if (imageUrl) {
+          const base64Data = imageUrl.split(',')[1];
+          const uint8Array = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0));
+          children.push(
+            new Paragraph({
+              children: [
+                new ImageRun({
+                  data: uint8Array,
+                  transformation: { width: 400, height: 400 },
+                  type: 'png'
+                }),
+              ],
+            })
+          );
+        }
+
+        children.push(
+          new Paragraph({
+            children: [new TextRun(text)],
+          })
+        );
+      }
+
+      const doc = new Document({
+        sections: [{ properties: {}, children }],
+      });
+
+      const blob = await Packer.toBlob(doc);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${file.name.replace('.pdf', '')}.docx`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+    } catch (error) {
+      console.error("DOCX export failed:", error);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
   const handleTimeUpdate = () => {
     if (audioRef.current && isPlaying) {
       const { currentTime, duration } = audioRef.current;
@@ -482,11 +812,28 @@ export default function App() {
 
   useEffect(() => {
     if (audioRef.current) {
-      audioRef.current.pause();
-      setIsPlaying(false);
-      setCurrentWordIndex(-1);
+      audioRef.current.playbackRate = speechRate;
     }
+    if (provider === 'offline' && isPlaying) {
+      // Offline speech requires restarting to change rate, but let's just update next time
+    }
+  }, [speechRate]);
+
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+    }
+    offlineSpeech.stop();
+    setIsPlaying(false);
+    setCurrentWordIndex(-1);
   }, [currentPage]);
+
+  useEffect(() => {
+    if (autoPlayNext && pagesData[currentPage]?.text) {
+      setAutoPlayNext(false);
+      handleNarrate();
+    }
+  }, [autoPlayNext, currentPage, pagesData]);
 
   useEffect(() => {
     if (pdfDoc) {
@@ -510,20 +857,21 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen flex bg-zinc-950 text-white overflow-hidden">
+    <div className={cn("min-h-screen flex overflow-hidden transition-colors duration-500", darkMode ? "dark bg-zinc-950 text-white" : "bg-zinc-50 text-zinc-900")}>
       {/* Sidebar */}
       <AnimatePresence mode="wait">
-        {(isSidebarOpen || !isMobile) && (
+        {isSidebarOpen && (
           <motion.aside
             initial={isMobile ? { x: -300 } : { width: 0 }}
             animate={isMobile ? { x: 0 } : { width: 280 }}
             exit={isMobile ? { x: -300 } : { width: 0 }}
             className={cn(
-              "z-50 flex flex-col glass border-r border-white/10 h-screen overflow-hidden",
+              "z-50 flex flex-col glass border-r border-white/10 h-screen overflow-hidden shrink-0",
               isMobile ? "fixed inset-y-0 left-0 w-[280px]" : "relative"
             )}
           >
-            <div className="p-6 flex items-center justify-between border-b border-white/5">
+            <div className="w-[280px] h-full flex flex-col">
+              <div className="p-6 flex items-center justify-between border-b border-white/5">
               <button 
                 onClick={resetApp}
                 className="flex items-center gap-3 hover:opacity-80 transition-opacity group"
@@ -550,16 +898,59 @@ export default function App() {
                   <span>{file ? 'Change Book' : 'Upload PDF'}</span>
                 </button>
                 {file && (
-                  <button 
-                    onClick={exportWithBackgrounds}
-                    disabled={isExporting}
-                    className="w-full px-4 py-3 rounded-xl bg-purple-500/10 hover:bg-purple-500/20 border border-purple-500/20 transition-all flex items-center gap-3 text-sm font-medium text-purple-400 disabled:opacity-50"
-                  >
-                    {isExporting ? <Loader2 className="animate-spin w-4 h-4" /> : <Download size={18} />}
-                    <span>Export Illustrated</span>
-                  </button>
+                  <div className="space-y-2">
+                    <button 
+                      onClick={exportWithBackgrounds}
+                      disabled={isExporting || isExportingAudiobook}
+                      className="w-full px-4 py-3 rounded-xl bg-purple-500/10 hover:bg-purple-500/20 border border-purple-500/20 transition-all flex items-center gap-3 text-sm font-medium text-purple-400 disabled:opacity-50"
+                    >
+                      {isExporting ? <Loader2 className="animate-spin w-4 h-4" /> : <Download size={18} />}
+                      <span>Export PDF</span>
+                    </button>
+                    <button 
+                      onClick={exportEpub}
+                      disabled={isExporting || isExportingAudiobook}
+                      className="w-full px-4 py-3 rounded-xl bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/20 transition-all flex items-center gap-3 text-sm font-medium text-blue-400 disabled:opacity-50"
+                    >
+                      {isExporting ? <Loader2 className="animate-spin w-4 h-4" /> : <Download size={18} />}
+                      <span>Export EPUB</span>
+                    </button>
+                    <button 
+                      onClick={exportDocx}
+                      disabled={isExporting || isExportingAudiobook}
+                      className="w-full px-4 py-3 rounded-xl bg-indigo-500/10 hover:bg-indigo-500/20 border border-indigo-500/20 transition-all flex items-center gap-3 text-sm font-medium text-indigo-400 disabled:opacity-50"
+                    >
+                      {isExporting ? <Loader2 className="animate-spin w-4 h-4" /> : <Download size={18} />}
+                      <span>Export DOCX</span>
+                    </button>
+                    <button 
+                      onClick={exportAudiobook}
+                      disabled={isExporting || isExportingAudiobook}
+                      className="w-full px-4 py-3 rounded-xl bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/20 transition-all flex items-center gap-3 text-sm font-medium text-emerald-400 disabled:opacity-50"
+                    >
+                      {isExportingAudiobook ? <Loader2 className="animate-spin w-4 h-4" /> : <Download size={18} />}
+                      <span>Export Audiobook</span>
+                    </button>
+                  </div>
                 )}
               </div>
+
+              {/* Progress */}
+              {isExportingAudiobook && (
+                <div className="p-4 rounded-2xl bg-white/5 border border-white/10 space-y-3">
+                  <div className="flex justify-between items-center">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400">Generating Audio</span>
+                    <span className="text-[10px] font-mono text-emerald-400">{audiobookProgress.completed}/{audiobookProgress.total}</span>
+                  </div>
+                  <div className="w-full h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+                    <motion.div 
+                      className="h-full bg-emerald-500"
+                      initial={{ width: 0 }}
+                      animate={{ width: `${(audiobookProgress.completed / Math.max(1, audiobookProgress.total)) * 100}%` }}
+                    />
+                  </div>
+                </div>
+              )}
 
               {/* Settings / Provider */}
               <div className="space-y-4">
@@ -590,19 +981,210 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Progress */}
-              {isBackgroundProcessing && (
-                <div className="p-4 rounded-2xl bg-white/5 border border-white/10 space-y-3">
-                  <div className="flex justify-between items-center">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400">Illustrating</span>
-                    <span className="text-[10px] font-mono text-purple-400">{backgroundProgress.completed}/{backgroundProgress.total}</span>
+              {/* Voice Selection */}
+              {provider === 'gemini' && (
+                <div className="space-y-4">
+                  <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 px-2">Voice</p>
+                  <div className="grid grid-cols-3 gap-2">
+                    {['Kore', 'Fenrir', 'Zephyr'].map((v) => (
+                      <button
+                        key={v}
+                        onClick={() => setVoice(v as any)}
+                        className={`p-2 rounded-xl border text-xs font-medium transition-all ${
+                          voice === v 
+                            ? 'bg-purple-500/20 border-purple-500/50 text-purple-300' 
+                            : 'bg-white/5 border-white/10 text-zinc-400 hover:bg-white/10'
+                        }`}
+                      >
+                        {v}
+                      </button>
+                    ))}
                   </div>
-                  <div className="w-full h-1.5 bg-zinc-800 rounded-full overflow-hidden">
-                    <motion.div 
-                      className="h-full vibrant-gradient"
-                      initial={{ width: 0 }}
-                      animate={{ width: `${(backgroundProgress.completed / backgroundProgress.total) * 100}%` }}
-                    />
+                </div>
+              )}
+
+              {/* Speech Rate */}
+              <div className="space-y-4">
+                <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 px-2 flex justify-between">
+                  <span>Speech Rate</span>
+                  <span>{speechRate}x</span>
+                </p>
+                <input
+                  type="range"
+                  min="0.5"
+                  max="2"
+                  step="0.1"
+                  value={speechRate}
+                  onChange={(e) => setSpeechRate(parseFloat(e.target.value))}
+                  className="w-full accent-purple-500"
+                />
+              </div>
+
+              {/* Custom Pronunciations */}
+              <div className="space-y-4">
+                <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 px-2">Custom Pronunciations</p>
+                <div className="space-y-2">
+                  {customPronunciations.map((cp, idx) => (
+                    <div key={idx} className="flex gap-2">
+                      <input
+                        type="text"
+                        value={cp.word}
+                        onChange={(e) => {
+                          const newCp = [...customPronunciations];
+                          newCp[idx].word = e.target.value;
+                          setCustomPronunciations(newCp);
+                        }}
+                        placeholder="Word"
+                        className="w-1/2 bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-xs text-zinc-300 focus:outline-none focus:border-purple-500/50"
+                      />
+                      <input
+                        type="text"
+                        value={cp.pronunciation}
+                        onChange={(e) => {
+                          const newCp = [...customPronunciations];
+                          newCp[idx].pronunciation = e.target.value;
+                          setCustomPronunciations(newCp);
+                        }}
+                        placeholder="Pronunciation"
+                        className="w-1/2 bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-xs text-zinc-300 focus:outline-none focus:border-purple-500/50"
+                      />
+                      <button
+                        onClick={() => {
+                          const newCp = [...customPronunciations];
+                          newCp.splice(idx, 1);
+                          setCustomPronunciations(newCp);
+                        }}
+                        className="p-2 text-zinc-500 hover:text-red-400 transition-colors"
+                      >
+                        <X size={14} />
+                      </button>
+                    </div>
+                  ))}
+                  <button
+                    onClick={() => setCustomPronunciations([...customPronunciations, { word: '', pronunciation: '' }])}
+                    className="w-full py-2 border border-dashed border-white/20 rounded-xl text-xs text-zinc-400 hover:text-zinc-300 hover:border-white/40 transition-colors"
+                  >
+                    + Add Pronunciation
+                  </button>
+                </div>
+              </div>
+
+              {/* Art Style Selection */}
+              <div className="space-y-4">
+                <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 px-2">Art Style</p>
+                <div className="space-y-2">
+                  <select
+                    value={artStyle}
+                    onChange={(e) => setArtStyle(e.target.value)}
+                    className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 text-sm text-zinc-300 focus:outline-none focus:border-purple-500/50 appearance-none"
+                  >
+                    <option value="Cinematic">Cinematic</option>
+                    <option value="Impressionistic">Impressionistic</option>
+                    <option value="Cyberpunk">Cyberpunk</option>
+                    <option value="Vintage">Vintage</option>
+                    <option value="Watercolor">Watercolor</option>
+                    <option value="Anime">Anime</option>
+                  </select>
+                  <input
+                    type="text"
+                    value={negativePrompt}
+                    onChange={(e) => setNegativePrompt(e.target.value)}
+                    placeholder="Negative prompt (e.g. text, watermark)"
+                    className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 text-sm text-zinc-300 focus:outline-none focus:border-purple-500/50 placeholder:text-zinc-600"
+                  />
+                </div>
+              </div>
+
+              {/* Typography Settings */}
+              <div className="space-y-4">
+                <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 px-2 flex items-center gap-2">
+                  <Type size={12} />
+                  Typography
+                </p>
+                <div className="space-y-2">
+                  <select
+                    value={fontFamily}
+                    onChange={(e) => setFontFamily(e.target.value)}
+                    className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 text-sm text-zinc-300 focus:outline-none focus:border-purple-500/50 appearance-none"
+                  >
+                    <option value="font-sans">Sans Serif</option>
+                    <option value="font-serif">Serif</option>
+                    <option value="font-mono">Monospace</option>
+                    <option value="cursive">Cursive</option>
+                  </select>
+                  <select
+                    value={fontSize}
+                    onChange={(e) => setFontSize(e.target.value)}
+                    className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 text-sm text-zinc-300 focus:outline-none focus:border-purple-500/50 appearance-none"
+                  >
+                    <option value="text-base md:text-lg">Small</option>
+                    <option value="text-lg md:text-2xl">Medium</option>
+                    <option value="text-xl md:text-3xl">Large</option>
+                    <option value="text-2xl md:text-4xl">Extra Large</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* Theme & Playback Settings */}
+              <div className="space-y-4">
+                <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 px-2">Preferences</p>
+                <div className="space-y-2">
+                  <button
+                    onClick={() => setDarkMode(!darkMode)}
+                    className="w-full flex items-center justify-between px-4 py-3 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 transition-all text-sm font-medium text-zinc-300"
+                  >
+                    <div className="flex items-center gap-3">
+                      {darkMode ? <Moon size={18} className="text-purple-400" /> : <Sun size={18} className="text-amber-400" />}
+                      <span>{darkMode ? 'Dark Mode' : 'Light Mode'}</span>
+                    </div>
+                    <div className={cn(
+                      "w-8 h-4 rounded-full transition-colors relative",
+                      darkMode ? "bg-purple-500" : "bg-zinc-600"
+                    )}>
+                      <div className={cn(
+                        "absolute top-0.5 w-3 h-3 rounded-full bg-white transition-transform",
+                        darkMode ? "left-4" : "left-0.5"
+                      )} />
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => setIsAutoPlayEnabled(!isAutoPlayEnabled)}
+                    className="w-full flex items-center justify-between px-4 py-3 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 transition-all text-sm font-medium text-zinc-300"
+                  >
+                    <div className="flex items-center gap-3">
+                      <Play size={18} className={isAutoPlayEnabled ? "text-emerald-400" : "text-zinc-500"} />
+                      <span>Auto-play Next Page</span>
+                    </div>
+                    <div className={cn(
+                      "w-8 h-4 rounded-full transition-colors relative",
+                      isAutoPlayEnabled ? "bg-emerald-500" : "bg-zinc-600"
+                    )}>
+                      <div className={cn(
+                        "absolute top-0.5 w-3 h-3 rounded-full bg-white transition-transform",
+                        isAutoPlayEnabled ? "left-4" : "left-0.5"
+                      )} />
+                    </div>
+                  </button>
+                </div>
+              </div>
+
+              {/* History */}
+              {pageHistory.length > 1 && (
+                <div className="space-y-4">
+                  <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 px-2 flex items-center gap-2">
+                    <History size={12} />
+                    History
+                  </p>
+                  <div className="flex flex-wrap gap-2 px-2">
+                    {pageHistory.slice(0, -1).reverse().map((p, i) => (
+                      <button
+                        key={`${p}-${i}`}
+                        onClick={() => setCurrentPage(p)}
+                        className="px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-xs text-zinc-400 hover:bg-white/10 hover:text-white transition-colors"
+                      >
+                        Page {p}
+                      </button>
+                    ))}
                   </div>
                 </div>
               )}
@@ -619,6 +1201,7 @@ export default function App() {
               <div className="px-4 py-2 text-[10px] text-zinc-600 font-mono">
                 v1.2.0 • Stable
               </div>
+            </div>
             </div>
           </motion.aside>
         )}
@@ -671,122 +1254,123 @@ export default function App() {
         </AnimatePresence>
 
         {/* Top Bar for Mobile & Desktop Sidebar Toggle */}
-        <header className="relative z-30 p-4 flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            {(!isSidebarOpen || isMobile) && (
+        {(!isSidebarOpen || isMobile) && (
+          <header className="relative z-30 p-4 flex items-center justify-between">
+            <div className="flex items-center gap-4">
               <button 
                 onClick={() => setIsSidebarOpen(true)}
                 className="p-2 rounded-xl glass text-white hover:bg-white/10 transition-all"
               >
                 <Menu size={24} />
               </button>
-            )}
-            {isMobile && !isSidebarOpen && (
-              <div className="flex items-center gap-2">
-                <div className="w-6 h-6 rounded-lg vibrant-gradient flex items-center justify-center">
-                  <BookOpen className="text-white w-3 h-3" />
+              {isMobile && !isSidebarOpen && (
+                <div className="flex items-center gap-2">
+                  <div className="w-6 h-6 rounded-lg vibrant-gradient flex items-center justify-center">
+                    <BookOpen className="text-white w-3 h-3" />
+                  </div>
+                  <span className="font-serif italic text-lg">Lumina</span>
                 </div>
-                <span className="font-serif italic text-lg">Lumina</span>
-              </div>
-            )}
-          </div>
-          <div className="w-10" /> {/* Spacer */}
-        </header>
+              )}
+            </div>
+            <div className="w-10" /> {/* Spacer */}
+          </header>
+        )}
 
         {/* Main Reader */}
-        <main className="flex-1 relative z-10 overflow-y-auto px-4 py-8 md:p-12 flex flex-col items-center">
+        <main className="flex-1 relative z-10 overflow-y-auto px-4 py-6 md:p-8 flex flex-col items-center">
           {!file ? (
-            <div className="flex-1 flex flex-col items-center justify-center text-center space-y-12 max-w-2xl">
+            <div className="flex-1 flex flex-col items-center justify-center text-center w-full max-w-md mx-auto">
               <motion.div 
                 initial={{ opacity: 0, y: 20 }}
                 animate={{ opacity: 1, y: 0 }}
-                className="space-y-6"
+                className="glass p-8 md:p-10 rounded-[2rem] border border-white/10 flex flex-col items-center gap-6 w-full shadow-2xl"
               >
-                <div className="relative inline-block">
-                  <div className="absolute -inset-4 bg-purple-500/20 blur-3xl rounded-full" />
-                  <h2 className="text-5xl md:text-7xl font-serif italic text-white leading-tight">
-                    Read with <br />
-                    <span className="cursive text-purple-400 text-6xl md:text-8xl">Atmosphere</span>
-                  </h2>
+                <div className="w-16 h-16 rounded-2xl vibrant-gradient flex items-center justify-center shadow-lg shadow-purple-500/20">
+                  <BookOpen className="text-white w-8 h-8" />
                 </div>
-                <p className="text-zinc-400 text-lg font-light leading-relaxed">
-                  Upload your favorite book and let Lumina generate unique, AI-powered backgrounds and voice narration.
-                </p>
+                
+                <div className="space-y-2">
+                  <h2 className="text-2xl font-serif italic text-white">Welcome to Lumina</h2>
+                  <p className="text-zinc-400 text-sm leading-relaxed">
+                    Upload a PDF to begin your immersive reading experience with AI-powered visuals and narration.
+                  </p>
+                </div>
+                
+                <button 
+                  onClick={() => fileInputRef.current?.click()}
+                  className="w-full group relative px-8 py-4 rounded-xl vibrant-gradient text-white font-bold shadow-lg hover:scale-[1.02] transition-all active:scale-[0.98]"
+                >
+                  <span className="flex items-center justify-center gap-3">
+                    <Upload size={20} />
+                    Select PDF
+                  </span>
+                </button>
               </motion.div>
-              
-              <button 
-                onClick={() => fileInputRef.current?.click()}
-                className="group relative px-10 py-5 rounded-full vibrant-gradient text-white font-bold text-xl shadow-2xl shadow-purple-500/40 hover:scale-105 transition-all active:scale-95"
-              >
-                <div className="absolute inset-0 rounded-full bg-white/20 opacity-0 group-hover:opacity-100 transition-opacity" />
-                <span className="flex items-center gap-3">
-                  <Upload size={24} />
-                  Get Started
-                </span>
-              </button>
-
-              <div className="grid grid-cols-3 gap-8 pt-12">
-                {[
-                  { icon: Sparkles, label: 'AI Visuals' },
-                  { icon: Volume2, label: 'Narration' },
-                  { icon: BookOpen, label: 'Atmosphere' }
-                ].map((item, i) => (
-                  <div key={i} className="flex flex-col items-center gap-2">
-                    <div className="w-12 h-12 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-center text-zinc-400">
-                      <item.icon size={20} />
-                    </div>
-                    <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">{item.label}</span>
-                  </div>
-                ))}
-              </div>
             </div>
           ) : (
-            <div className="w-full max-w-4xl space-y-8">
+            <div className="w-full max-w-4xl space-y-6 pb-24">
               {/* Reader Header */}
-              <div className="flex flex-col md:flex-row justify-between items-center gap-6 px-4">
-                <div className="flex items-center gap-4 bg-white/5 p-1.5 rounded-full border border-white/10">
+              <div className="flex flex-col md:flex-row justify-between items-center gap-4 px-2">
+                <div className="flex items-center gap-2 bg-white/5 p-1.5 rounded-full border border-white/10 w-full md:w-auto justify-between md:justify-start">
                   <button 
                     onClick={goToPrevPage}
                     disabled={currentPage === 1}
-                    className="p-2.5 rounded-full hover:bg-white/10 disabled:opacity-20 transition-all"
+                    className="p-2 md:p-2.5 rounded-full hover:bg-white/10 disabled:opacity-20 transition-all"
                   >
                     <ChevronLeft size={20} />
                   </button>
-                  <div className="px-4 text-white font-serif italic text-lg min-w-[100px] text-center">
+                  <div className="px-2 md:px-4 text-white font-serif italic text-base md:text-lg min-w-[100px] text-center">
                     Page {currentPage} <span className="text-zinc-500 text-xs not-italic ml-1">/ {numPages}</span>
                   </div>
                   <button 
                     onClick={goToNextPage}
                     disabled={currentPage === numPages}
-                    className="p-2.5 rounded-full hover:bg-white/10 disabled:opacity-20 transition-all"
+                    className="p-2 md:p-2.5 rounded-full hover:bg-white/10 disabled:opacity-20 transition-all"
                   >
                     <ChevronRight size={20} />
                   </button>
                 </div>
 
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-3 w-full md:w-auto justify-center">
+                  <button 
+                    onClick={handleSummarize}
+                    disabled={pagesData[currentPage]?.summaryLoading}
+                    className="flex-1 md:flex-none flex items-center justify-center gap-2 px-6 py-2.5 md:py-3 rounded-full bg-blue-500/20 text-blue-400 font-bold border border-blue-500/30 hover:bg-blue-500/30 transition-all active:scale-95 disabled:opacity-50"
+                  >
+                    {pagesData[currentPage]?.summaryLoading ? (
+                      <Loader2 className="animate-spin w-5 h-5" />
+                    ) : (
+                      <BookOpen size={18} />
+                    )}
+                    <span className="cursive text-lg md:text-xl hidden md:inline">Summarize</span>
+                  </button>
+
                   <button 
                     onClick={handleNarrate}
                     disabled={pagesData[currentPage]?.audioLoading}
-                    className="flex items-center gap-3 px-6 py-3 rounded-full bg-purple-500 text-white font-bold shadow-lg shadow-purple-500/20 hover:scale-105 transition-all active:scale-95 disabled:opacity-50"
+                    className="flex-1 md:flex-none flex items-center justify-center gap-2 px-6 py-2.5 md:py-3 rounded-full bg-purple-500 text-white font-bold shadow-lg shadow-purple-500/20 hover:scale-105 transition-all active:scale-95 disabled:opacity-50"
                   >
                     {pagesData[currentPage]?.audioLoading ? (
                       <Loader2 className="animate-spin w-5 h-5" />
                     ) : isPlaying ? (
-                      <Pause size={20} />
+                      <Pause size={18} />
                     ) : (
-                      <Play size={20} />
+                      <Play size={18} />
                     )}
-                    <span className="cursive text-xl">{isPlaying ? 'Pause' : 'Listen'}</span>
+                    <span className="cursive text-lg md:text-xl">{isPlaying ? 'Pause' : 'Listen'}</span>
                   </button>
 
                   <button 
-                    onClick={handleRefreshIllustration}
+                    onClick={handleGenerateIllustration}
                     disabled={pagesData[currentPage]?.loading}
-                    className="p-3.5 rounded-full glass text-zinc-400 hover:text-white transition-all hover:rotate-180 duration-500"
-                    title="Regenerate Illustration"
+                    className="p-3 md:p-3.5 rounded-full glass text-zinc-400 hover:text-white transition-all duration-500 shrink-0"
+                    title={pagesData[currentPage]?.imageUrl ? "Regenerate Illustration" : "Generate Illustration"}
                   >
-                    <Sparkles size={20} className={pagesData[currentPage]?.loading ? 'animate-pulse' : ''} />
+                    {pagesData[currentPage]?.loading ? (
+                      <Loader2 size={18} className="animate-spin text-purple-400" />
+                    ) : (
+                      <Sparkles size={18} className="hover:rotate-180 transition-transform duration-500" />
+                    )}
                   </button>
                 </div>
               </div>
@@ -800,8 +1384,8 @@ export default function App() {
                 transition={{ type: "spring", damping: 25, stiffness: 120 }}
                 className="relative group"
               >
-                <div className="absolute -inset-1 bg-gradient-to-r from-purple-500/20 to-emerald-500/20 rounded-[2.5rem] blur opacity-25 group-hover:opacity-50 transition duration-1000 group-hover:duration-200" />
-                <div className="relative glass p-4 md:p-8 rounded-[2.5rem] shadow-2xl min-h-[65vh] overflow-hidden flex flex-col items-center justify-center paper-texture border border-white/10">
+                <div className="absolute -inset-1 bg-gradient-to-r from-purple-500/20 to-emerald-500/20 rounded-[2rem] md:rounded-[2.5rem] blur opacity-25 group-hover:opacity-50 transition duration-1000 group-hover:duration-200" />
+                <div className="relative glass p-3 md:p-8 rounded-[2rem] md:rounded-[2.5rem] shadow-2xl min-h-[50vh] md:min-h-[65vh] overflow-hidden flex flex-col items-center justify-center paper-texture border border-white/10">
                   
                   <div className="relative z-20 w-full flex flex-col items-center justify-center">
                     {pagesData[currentPage]?.loading && !pagesData[currentPage]?.text && (
@@ -816,7 +1400,7 @@ export default function App() {
                     
                     <canvas 
                       ref={canvasRef} 
-                      className="max-w-full h-auto rounded-xl shadow-2xl transition-all duration-1000 mx-auto opacity-100 border border-white/5"
+                      className="max-w-full max-h-[70vh] object-contain rounded-xl shadow-2xl transition-all duration-1000 mx-auto opacity-100 border border-white/5"
                     />
 
                     {isIllustrationDisabled && (
@@ -833,17 +1417,18 @@ export default function App() {
                         initial={{ opacity: 0, y: 20 }}
                         animate={{ opacity: 1, y: 0 }}
                         exit={{ opacity: 0, y: 10 }}
-                        className="absolute inset-x-0 bottom-0 z-30 p-8 pointer-events-none flex justify-center"
+                        className="absolute inset-x-0 bottom-0 z-30 p-4 md:p-8 pointer-events-none flex justify-center"
                       >
-                        <div className="bg-black/60 backdrop-blur-2xl p-8 rounded-[2rem] border border-white/10 max-w-3xl text-center shadow-2xl">
-                          <div className="flex flex-wrap justify-center gap-x-3 gap-y-2">
+                        <div className="bg-black/60 backdrop-blur-2xl p-4 md:p-8 rounded-[1.5rem] md:rounded-[2rem] border border-white/10 max-w-3xl text-center shadow-2xl">
+                          <div className={cn("flex flex-wrap justify-center gap-x-2 md:gap-x-3 gap-y-1 md:gap-y-2", fontFamily)}>
                             {pagesData[currentPage].text.split(/\s+/).filter(w => w.length > 0).map((word, i) => (
                               <span 
                                 key={`word-${currentPage}-${i}`} 
                                 className={cn(
-                                  "text-xl md:text-2xl transition-all duration-300",
+                                  "transition-all duration-300",
+                                  fontSize,
                                   i === currentWordIndex 
-                                    ? "text-purple-400 scale-125 font-bold drop-shadow-[0_0_15px_rgba(168,85,247,0.8)]" 
+                                    ? "text-purple-400 scale-110 md:scale-125 font-bold drop-shadow-[0_0_15px_rgba(168,85,247,0.8)]" 
                                     : "text-white/30"
                                 )}
                               >
@@ -856,6 +1441,23 @@ export default function App() {
                     )}
                   </AnimatePresence>
                 </div>
+
+                {/* Summary Display */}
+                {pagesData[currentPage]?.summary && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="mt-6 p-6 rounded-2xl bg-blue-500/10 border border-blue-500/20 glass"
+                  >
+                    <h3 className="text-sm font-bold text-blue-400 mb-3 flex items-center gap-2 uppercase tracking-wider">
+                      <Sparkles size={16} />
+                      Page Summary
+                    </h3>
+                    <p className="text-zinc-300 text-sm leading-relaxed">
+                      {pagesData[currentPage].summary}
+                    </p>
+                  </motion.div>
+                )}
               </motion.div>
             </div>
           )}
@@ -863,22 +1465,22 @@ export default function App() {
 
         {/* Floating Page Controls */}
         {file && (
-          <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-40 flex items-center gap-4">
-            <div className="glass px-6 py-3 rounded-full flex items-center gap-6 shadow-2xl border border-white/10">
-              <div className="flex items-center gap-3">
-                <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Go to</span>
+          <div className="absolute bottom-4 md:bottom-8 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2 md:gap-4 w-[90%] md:w-auto max-w-md">
+            <div className="glass px-4 md:px-6 py-2 md:py-3 rounded-full flex items-center justify-between md:justify-center gap-4 md:gap-6 shadow-2xl border border-white/10 w-full">
+              <div className="flex items-center gap-2 md:gap-3 flex-1">
+                <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-500 hidden md:inline">Go to</span>
                 <input 
                   type="range" 
                   min="1" 
                   max={numPages} 
                   value={currentPage} 
                   onChange={(e) => setCurrentPage(parseInt(e.target.value))}
-                  className="w-32 md:w-48 accent-purple-500"
+                  className="w-full md:w-48 accent-purple-500"
                 />
               </div>
-              <div className="h-4 w-px bg-zinc-800" />
-              <div className="flex items-center gap-2">
-                <History size={14} className="text-zinc-500" />
+              <div className="h-4 w-px bg-zinc-800 hidden md:block" />
+              <div className="flex items-center gap-2 shrink-0">
+                <History size={14} className="text-zinc-500 hidden md:block" />
                 <span className="text-xs font-mono text-zinc-400">{currentPage}/{numPages}</span>
               </div>
             </div>
@@ -892,6 +1494,14 @@ export default function App() {
         onEnded={() => {
           setIsPlaying(false);
           setCurrentWordIndex(-1);
+          if (isAutoPlayEnabled && currentPage < numPages) {
+            setAutoPlayNext(true);
+            setCurrentPage(prev => {
+              const next = prev + 1;
+              if (next === numPages) triggerConfetti();
+              return next;
+            });
+          }
         }}
         onTimeUpdate={handleTimeUpdate}
         className="hidden"
