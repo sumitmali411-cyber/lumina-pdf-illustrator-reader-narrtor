@@ -9,37 +9,6 @@ export class QuotaExceededError extends Error {
   }
 }
 
-export async function getBackgroundPrompt(pageText: string, iteration: number = 1, style: string = 'Cinematic'): Promise<string> {
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: `Analyze the following text from a book page and describe a highly detailed, cinematic, and artistic background image that captures the core essence and atmosphere of the scene. 
-      
-      ${iteration > 1 ? "This is a REFINEMENT. Make the previous concept more vivid, focusing on lighting, texture, and emotional depth." : ""}
-      
-      The description should be optimized for a high-end image generation model (like FLUX or Imagen). 
-      Focus on:
-      - Lighting (e.g., "golden hour glow", "moody chiaroscuro", "ethereal bioluminescence")
-      - Style: The requested artistic style is "${style}". Ensure the prompt reflects this specific style.
-      - Composition (e.g., "wide angle landscape", "intimate close-up with bokeh")
-      - Color Palette: Suggest colors that match the emotional tone.
-      
-      IMPORTANT: The image should be "atmospheric" and "artistic" but remain subtle enough to serve as a background for reading.
-      
-      Text: ${pageText.substring(0, 2500)}
-      
-      Return ONLY the descriptive image prompt.`,
-    });
-    
-    return response.text || "A subtle greyish atmospheric minimalist background";
-  } catch (error: any) {
-    if (error?.message?.includes("429") || error?.message?.toLowerCase().includes("quota")) {
-      throw new QuotaExceededError("API quota reached");
-    }
-    throw error;
-  }
-}
-
 export async function summarizeText(text: string): Promise<string | null> {
   try {
     const response = await ai.models.generateContent({
@@ -49,41 +18,6 @@ export async function summarizeText(text: string): Promise<string | null> {
     return response.text || null;
   } catch (error) {
     console.error("Summarization failed:", error);
-    return null;
-  }
-}
-
-export async function generateBackgroundImage(prompt: string, negativePrompt?: string): Promise<string | null> {
-  try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash-image',
-      contents: {
-        parts: [
-          {
-            text: `${prompt}. Atmospheric, artistic, high key, soft focus, ethereal, high quality digital art.${negativePrompt ? ` DO NOT INCLUDE: ${negativePrompt}` : ''}`,
-          },
-        ],
-      },
-      config: {
-        imageConfig: {
-          aspectRatio: "9:16",
-        },
-      },
-    });
-
-    for (const part of response.candidates?.[0]?.content?.parts || []) {
-      if (part.inlineData) {
-        console.log("Successfully generated background image");
-        return `data:image/png;base64,${part.inlineData.data}`;
-      }
-    }
-    console.warn("No image data found in Gemini response");
-    return null;
-  } catch (error: any) {
-    if (error?.message?.includes("429") || error?.message?.toLowerCase().includes("quota")) {
-      throw new QuotaExceededError("API quota reached");
-    }
-    console.error("Image generation failed:", error);
     return null;
   }
 }

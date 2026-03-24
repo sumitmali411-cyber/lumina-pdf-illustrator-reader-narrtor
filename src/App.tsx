@@ -2,18 +2,17 @@ import React, { useState, useRef, useEffect } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import { Upload, BookOpen, ChevronLeft, ChevronRight, Loader2, Sparkles, Download, Play, Pause, Volume2, X, HelpCircle, Menu, Settings, Info, History, Layers, Moon, Sun, Type, FileText } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { getBackgroundPrompt, generateBackgroundImage, generateSpeech, generateSpeechPCM, createWavHeader, QuotaExceededError, summarizeText } from './services/geminiService';
-import { generateOpenImage, generateOpenSpeech } from './services/openSourceService';
+import { generateSpeech, generateSpeechPCM, createWavHeader, QuotaExceededError, summarizeText } from './services/geminiService';
+import { generateOpenSpeech } from './services/openSourceService';
 import { offlineSpeech } from './services/offlineSpeechService';
 import OfflineBackground from './components/OfflineBackground';
-import GenerativeIllustration from './components/GenerativeIllustration';
 import ArchitectureDiagram from './components/ArchitectureDiagram';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { jsPDF } from 'jspdf';
 import confetti from 'canvas-confetti';
 import JSZip from 'jszip';
-import { Document, Packer, Paragraph, TextRun, ImageRun } from 'docx';
+import { Document, Packer, Paragraph, TextRun } from 'docx';
 
 // Utility for tailwind classes
 function cn(...inputs: ClassValue[]) {
@@ -25,7 +24,6 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLi
 
 interface PageData {
   text: string;
-  imageUrl: string | null;
   audioUrl: string | null;
   loading: boolean;
   audioLoading: boolean;
@@ -46,7 +44,6 @@ export default function App() {
   const [isExportingAudiobook, setIsExportingAudiobook] = useState(false);
   const [audiobookProgress, setAudiobookProgress] = useState({ completed: 0, total: 0 });
   const [currentWordIndex, setCurrentWordIndex] = useState<number>(-1);
-  const [isIllustrationDisabled, setIsIllustrationDisabled] = useState(false);
   const [showQuotaWarning, setShowQuotaWarning] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [provider, setProvider] = useState<'gemini' | 'open-source' | 'offline'>('gemini');
@@ -54,15 +51,15 @@ export default function App() {
   const [isMobile, setIsMobile] = useState(false);
   const [autoPlayNext, setAutoPlayNext] = useState(false);
   const [voice, setVoice] = useState<'Kore' | 'Fenrir' | 'Zephyr'>('Kore');
-  const [artStyle, setArtStyle] = useState<string>('Cinematic');
   const [pageHistory, setPageHistory] = useState<number[]>([]);
   const [fontFamily, setFontFamily] = useState<string>('font-sans');
   const [fontSize, setFontSize] = useState<string>('text-lg md:text-2xl');
   const [darkMode, setDarkMode] = useState<boolean>(true);
-  const [negativePrompt, setNegativePrompt] = useState<string>('');
   const [isAutoPlayEnabled, setIsAutoPlayEnabled] = useState<boolean>(true);
   const [speechRate, setSpeechRate] = useState<number>(1);
   const [customPronunciations, setCustomPronunciations] = useState<{word: string, pronunciation: string}[]>([]);
+  const [touchStartX, setTouchStartX] = useState<number | null>(null);
+  const [touchEndX, setTouchEndX] = useState<number | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -128,7 +125,7 @@ export default function App() {
     if (pageNum === currentPage) {
       setPagesData(prev => ({
         ...prev,
-        [pageNum]: { ...prev[pageNum], loading: false, audioLoading: false, audioUrl: null, text: prev[pageNum]?.text || '', imageUrl: prev[pageNum]?.imageUrl || null }
+        [pageNum]: { ...prev[pageNum], loading: false, audioLoading: false, audioUrl: null, text: prev[pageNum]?.text || '' }
       }));
     }
 
@@ -154,7 +151,7 @@ export default function App() {
       console.error(`Error loading page ${pageNum}:`, error);
       setPagesData(prev => ({
         ...prev,
-        [pageNum]: { ...prev[pageNum], text: 'Error loading page content.', imageUrl: null, loading: false }
+        [pageNum]: { ...prev[pageNum], text: 'Error loading page content.', loading: false }
       }));
     } finally {
       loadingPagesRef.current.delete(pageNum);
@@ -349,50 +346,6 @@ export default function App() {
     }
   };
 
-  const handleGenerateIllustration = async () => {
-    if (!pdfDoc || isExporting) return;
-    
-    setPagesData(prev => ({
-      ...prev,
-      [currentPage]: { ...prev[currentPage], loading: true, imageUrl: null }
-    }));
-    
-    setIsIllustrationDisabled(false);
-
-    try {
-      let text = pagesData[currentPage]?.text;
-      if (!text) {
-        const page = await pdfDoc.getPage(currentPage);
-        const textContent = await page.getTextContent();
-        text = textContent.items.map((item: any) => item.str).join(' ');
-      }
-
-      const prompt = await getBackgroundPrompt(text, 1, artStyle);
-      let imageUrl = null;
-      if (provider === 'gemini') {
-        imageUrl = await generateBackgroundImage(prompt, negativePrompt);
-      } else {
-        imageUrl = await generateOpenImage(prompt, negativePrompt);
-      }
-
-      setPagesData(prev => ({
-        ...prev,
-        [currentPage]: { ...prev[currentPage], imageUrl, loading: false }
-      }));
-    } catch (error) {
-      if (error instanceof QuotaExceededError) {
-        console.warn("Illustration limit reached.");
-        setIsIllustrationDisabled(true);
-      } else {
-        console.error(`Error generating illustration for page ${currentPage}:`, error);
-      }
-      setPagesData(prev => ({
-        ...prev,
-        [currentPage]: { ...prev[currentPage], loading: false }
-      }));
-    }
-  };
-
   const triggerConfetti = () => {
     const duration = 3 * 1000;
     const animationEnd = Date.now() + duration;
@@ -519,110 +472,6 @@ export default function App() {
     }
   };
 
-  const exportWithBackgrounds = async () => {
-    if (!pdfDoc || !file) return;
-    setIsExporting(true);
-    setExportProgress({ completed: 0, total: numPages });
-
-    try {
-      const pdf = new jsPDF('p', 'mm', 'a4');
-      const pdfWidth = pdf.internal.pageSize.getWidth();
-      const pdfHeight = pdf.internal.pageSize.getHeight();
-
-      for (let i = 1; i <= numPages; i++) {
-        setExportProgress(prev => ({ ...prev, completed: i }));
-        if (i > 1) pdf.addPage();
-
-        let pageData = pagesData[i];
-        if (!pageData || !pageData.imageUrl) {
-          try {
-            const page = await pdfDoc.getPage(i);
-            const textContent = await page.getTextContent();
-            const text = textContent.items.map((item: any) => item.str).join(' ');
-            
-            let imageUrl: string | null = null;
-            if (!isIllustrationDisabled) {
-              try {
-                const prompt = await getBackgroundPrompt(text, 1, artStyle);
-                imageUrl = await generateBackgroundImage(prompt, negativePrompt);
-              } catch (error) {
-                if (error instanceof QuotaExceededError) {
-                  setIsIllustrationDisabled(true);
-                  imageUrl = null;
-                } else {
-                  throw error;
-                }
-              }
-            }
-            
-            pageData = { text, imageUrl, loading: false, audioLoading: false, audioUrl: null };
-            setPagesData(prev => ({ ...prev, [i]: pageData }));
-          } catch (error) {
-            console.error(`Failed to generate background for page ${i}:`, error);
-            // Continue with fallback
-          }
-        }
-
-        const page = await pdfDoc.getPage(i);
-        const viewport = page.getViewport({ scale: 2 });
-        
-        // Create a combined canvas for the export
-        const exportCanvas = document.createElement('canvas');
-        exportCanvas.width = viewport.width;
-        exportCanvas.height = viewport.height;
-        const ctx = exportCanvas.getContext('2d');
-
-        if (ctx && pageData.imageUrl) {
-          // 1. Draw Background (Full size)
-          const bgImg = new Image();
-          bgImg.crossOrigin = "anonymous";
-          bgImg.src = pageData.imageUrl;
-          await new Promise((resolve) => {
-            bgImg.onload = resolve;
-            bgImg.onerror = resolve;
-          });
-          ctx.drawImage(bgImg, 0, 0, exportCanvas.width, exportCanvas.height);
-
-          // 2. Draw PDF Page as a centered "card" on top of the background
-          const padding = exportCanvas.width * 0.05; // 5% padding
-          const pdfCanvas = document.createElement('canvas');
-          pdfCanvas.width = viewport.width;
-          pdfCanvas.height = viewport.height;
-          const pdfCtx = pdfCanvas.getContext('2d');
-          if (pdfCtx) {
-            await page.render({ canvasContext: pdfCtx, viewport }).promise;
-            
-            // Draw a slight shadow/glow for the PDF page
-            ctx.shadowColor = 'rgba(0,0,0,0.5)';
-            ctx.shadowBlur = 20;
-            ctx.fillStyle = 'white';
-            ctx.fillRect(padding, padding, exportCanvas.width - padding * 2, exportCanvas.height - padding * 2);
-            
-            ctx.shadowBlur = 0;
-            ctx.drawImage(pdfCanvas, padding, padding, exportCanvas.width - padding * 2, exportCanvas.height - padding * 2);
-          }
-
-          const combinedImgData = exportCanvas.toDataURL('image/jpeg', 0.8);
-          pdf.addImage(combinedImgData, 'JPEG', 0, 0, pdfWidth, pdfHeight);
-        } else if (ctx) {
-          // Fallback if no image
-          await page.render({ canvasContext: ctx, viewport }).promise;
-          const pageImgData = exportCanvas.toDataURL('image/png');
-          pdf.addImage(pageImgData, 'PNG', 0, 0, pdfWidth, pdfHeight);
-        }
-      }
-
-      pdf.save(`Lumina_Illustrated_${file.name}`);
-      if (isIllustrationDisabled) {
-        setShowQuotaWarning(true);
-      }
-    } catch (error) {
-      console.error("Export failed:", error);
-    } finally {
-      setIsExporting(false);
-    }
-  };
-
   const exportEpub = async () => {
     if (!pdfDoc || !file) return;
     setIsExporting(true);
@@ -650,7 +499,6 @@ export default function App() {
         setExportProgress(prev => ({ ...prev, completed: i }));
         let pageData = pagesData[i];
         let text = pageData?.text;
-        let imageUrl = pageData?.imageUrl;
 
         if (!text) {
           const page = await pdfDoc.getPage(i);
@@ -658,28 +506,10 @@ export default function App() {
           text = textContent.items.map((item: any) => item.str).join(' ');
         }
 
-        if (!imageUrl && !isIllustrationDisabled) {
-          try {
-            const prompt = await getBackgroundPrompt(text, 1, artStyle);
-            imageUrl = await generateBackgroundImage(prompt, negativePrompt);
-          } catch (e) {
-            imageUrl = null;
-          }
-        }
-
-        let imageHtml = '';
-        if (imageUrl) {
-          const base64Data = imageUrl.split(',')[1];
-          oebps?.file(`image_${i}.jpg`, base64Data, {base64: true});
-          manifestItems += `<item id="img_${i}" href="image_${i}.jpg" media-type="image/jpeg"/>\n`;
-          imageHtml = `<img src="image_${i}.jpg" alt="Illustration for page ${i}" style="max-width: 100%;"/>`;
-        }
-
         const htmlContent = `<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head><title>Page ${i}</title></head>
 <body>
-  ${imageHtml}
   <p>${text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</p>
 </body>
 </html>`;
@@ -735,37 +565,11 @@ export default function App() {
         setExportProgress(prev => ({ ...prev, completed: i }));
         let pageData = pagesData[i];
         let text = pageData?.text;
-        let imageUrl = pageData?.imageUrl;
 
         if (!text) {
           const page = await pdfDoc.getPage(i);
           const textContent = await page.getTextContent();
           text = textContent.items.map((item: any) => item.str).join(' ');
-        }
-
-        if (!imageUrl && !isIllustrationDisabled) {
-          try {
-            const prompt = await getBackgroundPrompt(text, 1, artStyle);
-            imageUrl = await generateBackgroundImage(prompt, negativePrompt);
-          } catch (e) {
-            imageUrl = null;
-          }
-        }
-
-        if (imageUrl) {
-          const base64Data = imageUrl.split(',')[1];
-          const uint8Array = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0));
-          children.push(
-            new Paragraph({
-              children: [
-                new ImageRun({
-                  data: uint8Array,
-                  transformation: { width: 400, height: 400 },
-                  type: 'png'
-                }),
-              ],
-            })
-          );
         }
 
         children.push(
@@ -856,6 +660,30 @@ export default function App() {
     }
   };
 
+  const handleTouchStart = (e: React.TouchEvent) => {
+    setTouchStartX(e.targetTouches[0].clientX);
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    setTouchEndX(e.targetTouches[0].clientX);
+  };
+
+  const handleTouchEnd = () => {
+    if (!touchStartX || !touchEndX) return;
+    const distance = touchStartX - touchEndX;
+    const isLeftSwipe = distance > 50;
+    const isRightSwipe = distance < -50;
+    
+    if (isLeftSwipe) {
+      goToNextPage();
+    } else if (isRightSwipe) {
+      goToPrevPage();
+    }
+    
+    setTouchStartX(null);
+    setTouchEndX(null);
+  };
+
   return (
     <div className={cn("min-h-screen flex overflow-hidden transition-colors duration-500", darkMode ? "dark bg-zinc-950 text-white" : "bg-zinc-50 text-zinc-900")}>
       {/* Sidebar */}
@@ -899,14 +727,6 @@ export default function App() {
                 </button>
                 {file && (
                   <div className="space-y-2">
-                    <button 
-                      onClick={exportWithBackgrounds}
-                      disabled={isExporting || isExportingAudiobook}
-                      className="w-full px-4 py-3 rounded-xl bg-purple-500/10 hover:bg-purple-500/20 border border-purple-500/20 transition-all flex items-center gap-3 text-sm font-medium text-purple-400 disabled:opacity-50"
-                    >
-                      {isExporting ? <Loader2 className="animate-spin w-4 h-4" /> : <Download size={18} />}
-                      <span>Export PDF</span>
-                    </button>
                     <button 
                       onClick={exportEpub}
                       disabled={isExporting || isExportingAudiobook}
@@ -1069,32 +889,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Art Style Selection */}
-              <div className="space-y-4">
-                <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 px-2">Art Style</p>
-                <div className="space-y-2">
-                  <select
-                    value={artStyle}
-                    onChange={(e) => setArtStyle(e.target.value)}
-                    className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 text-sm text-zinc-300 focus:outline-none focus:border-purple-500/50 appearance-none"
-                  >
-                    <option value="Cinematic">Cinematic</option>
-                    <option value="Impressionistic">Impressionistic</option>
-                    <option value="Cyberpunk">Cyberpunk</option>
-                    <option value="Vintage">Vintage</option>
-                    <option value="Watercolor">Watercolor</option>
-                    <option value="Anime">Anime</option>
-                  </select>
-                  <input
-                    type="text"
-                    value={negativePrompt}
-                    onChange={(e) => setNegativePrompt(e.target.value)}
-                    placeholder="Negative prompt (e.g. text, watermark)"
-                    className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 text-sm text-zinc-300 focus:outline-none focus:border-purple-500/50 placeholder:text-zinc-600"
-                  />
-                </div>
-              </div>
-
               {/* Typography Settings */}
               <div className="space-y-4">
                 <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 px-2 flex items-center gap-2">
@@ -1225,32 +1019,13 @@ export default function App() {
         {/* Background Layers */}
         <OfflineBackground />
         <AnimatePresence mode="wait">
-          {pagesData[currentPage]?.imageUrl && !isIllustrationDisabled ? (
-            <motion.div
-              key={`bg-${pagesData[currentPage].imageUrl}-${currentPage}`}
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 0.6 }}
-              exit={{ opacity: 0 }}
-              transition={{ duration: 1.5 }}
-              className="absolute inset-0 z-0"
-            >
-              <img 
-                src={pagesData[currentPage].imageUrl || undefined} 
-                alt="Page background" 
-                className="w-full h-full object-cover"
-                referrerPolicy="no-referrer"
-              />
-              <div className="absolute inset-0 bg-gradient-to-b from-zinc-950/80 via-transparent to-zinc-950/80" />
-            </motion.div>
-          ) : (
-            <motion.div 
-              key={`bg-fallback-${currentPage}`}
-              className="absolute inset-0 z-0 bg-zinc-950"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-            />
-          )}
+          <motion.div 
+            key={`bg-fallback-${currentPage}`}
+            className="absolute inset-0 z-0 bg-zinc-950"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+          />
         </AnimatePresence>
 
         {/* Top Bar for Mobile & Desktop Sidebar Toggle */}
@@ -1277,7 +1052,12 @@ export default function App() {
         )}
 
         {/* Main Reader */}
-        <main className="flex-1 relative z-10 overflow-y-auto px-4 py-6 md:p-8 flex flex-col items-center">
+        <main 
+          className="flex-1 relative z-10 overflow-y-auto px-4 py-6 md:p-8 flex flex-col items-center"
+          onTouchStart={handleTouchStart}
+          onTouchMove={handleTouchMove}
+          onTouchEnd={handleTouchEnd}
+        >
           {!file ? (
             <div className="flex-1 flex flex-col items-center justify-center text-center w-full max-w-md mx-auto">
               <motion.div 
@@ -1359,19 +1139,6 @@ export default function App() {
                     )}
                     <span className="cursive text-lg md:text-xl">{isPlaying ? 'Pause' : 'Listen'}</span>
                   </button>
-
-                  <button 
-                    onClick={handleGenerateIllustration}
-                    disabled={pagesData[currentPage]?.loading}
-                    className="p-3 md:p-3.5 rounded-full glass text-zinc-400 hover:text-white transition-all duration-500 shrink-0"
-                    title={pagesData[currentPage]?.imageUrl ? "Regenerate Illustration" : "Generate Illustration"}
-                  >
-                    {pagesData[currentPage]?.loading ? (
-                      <Loader2 size={18} className="animate-spin text-purple-400" />
-                    ) : (
-                      <Sparkles size={18} className="hover:rotate-180 transition-transform duration-500" />
-                    )}
-                  </button>
                 </div>
               </div>
 
@@ -1402,12 +1169,6 @@ export default function App() {
                       ref={canvasRef} 
                       className="max-w-full max-h-[70vh] object-contain rounded-xl shadow-2xl transition-all duration-1000 mx-auto opacity-100 border border-white/5"
                     />
-
-                    {isIllustrationDisabled && (
-                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none opacity-30">
-                        <GenerativeIllustration seed={pagesData[currentPage]?.text || "default"} />
-                      </div>
-                    )}
                   </div>
 
                   {/* Highlighting Overlay */}
