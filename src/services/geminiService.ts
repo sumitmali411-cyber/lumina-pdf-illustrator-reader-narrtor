@@ -1,7 +1,3 @@
-import { GoogleGenAI, Modality } from "@google/genai";
-
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
-
 export class QuotaExceededError extends Error {
   constructor(message: string) {
     super(message);
@@ -9,13 +5,20 @@ export class QuotaExceededError extends Error {
   }
 }
 
+/**
+ * Summarizes via the server-side proxy. The Gemini API key stays on the
+ * server and is never exposed to the browser bundle.
+ */
 export async function summarizeText(text: string): Promise<string | null> {
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: `Summarize the following text from a book page concisely in 2-3 sentences. Capture the main events, ideas, or mood:\n\n${text.substring(0, 3000)}`
+    const response = await fetch("/api/summarize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
     });
-    return response.text || null;
+    if (!response.ok) throw new Error(`Summarize failed with status ${response.status}`);
+    const { summary } = (await response.json()) as { summary?: string | null };
+    return summary || null;
   } catch (error) {
     console.error("Summarization failed:", error);
     return null;
@@ -24,28 +27,31 @@ export async function summarizeText(text: string): Promise<string | null> {
 
 export async function generateSpeechPCM(text: string, voice: 'Kore' | 'Fenrir' | 'Zephyr' = 'Kore'): Promise<Uint8Array | null> {
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-preview-tts",
-      contents: [{ parts: [{ text: text }] }],
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: voice },
-          },
-        },
-      },
+    const response = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, voice }),
     });
 
-    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (base64Audio) {
-      return Uint8Array.from(atob(base64Audio), c => c.charCodeAt(0));
-    }
-    return null;
-  } catch (error: any) {
-    if (error?.message?.includes("429") || error?.message?.toLowerCase().includes("quota")) {
+    if (response.status === 429) {
       throw new QuotaExceededError("API quota reached");
     }
+
+    if (!response.ok) {
+      throw new Error(`Speech request failed with status ${response.status}`);
+    }
+
+    const { data } = (await response.json()) as { data?: string };
+    if (!data) return null;
+
+    // Reject anything that is not base64 before handing it to atob.
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(data)) {
+      throw new Error("Server returned malformed audio data.");
+    }
+
+    return Uint8Array.from(atob(data), c => c.charCodeAt(0));
+  } catch (error: any) {
+    if (error instanceof QuotaExceededError) throw error;
     console.error("Speech generation failed:", error);
     return null;
   }

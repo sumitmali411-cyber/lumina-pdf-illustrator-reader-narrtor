@@ -4,11 +4,15 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --port=3000 --host=0.0.0.0",
+    "dev": "concurrently -n server,client -c magenta,cyan \"npm:dev:server\" \"npm:dev:client\"",
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "dev:server": "tsx server/index.ts",
+    "dev:client": "vite --port=3000 --host=0.0.0.0",
+    "start": "tsx server/index.ts",
+    "audit": "npm audit --audit-level=high"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
@@ -18,7 +22,7 @@
     "clsx": "^2.1.1",
     "docx": "^9.6.1",
     "dotenv": "^17.2.3",
-    "express": "^4.21.2",
+    "express": "^5.2.1",
     "file-saver": "^2.0.5",
     "jspdf": "^4.2.0",
     "jszip": "^3.10.1",
@@ -35,11 +39,12 @@
   },
   "devDependencies": {
     "@types/canvas-confetti": "^1.9.0",
-    "@types/express": "^4.17.21",
+    "@types/express": "^5.0.6",
     "@types/node": "^22.14.0",
     "autoprefixer": "^10.4.21",
+    "concurrently": "^9.2.4",
     "tailwindcss": "^4.1.14",
-    "tsx": "^4.21.0",
+    "tsx": "^4.23.13",
     "typescript": "~5.8.2",
     "vite": "^6.2.0"
   }
