@@ -1,5 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
+// @ts-ignore - Vite resolves this to a bundled, same-origin worker URL.
+import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { Upload, BookOpen, ChevronLeft, ChevronRight, Loader2, Sparkles, Download, Play, Pause, Volume2, X, HelpCircle, Menu, Settings, Info, History, Layers, Moon, Sun, Type, FileText } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { generateSpeech, generateSpeechPCM, createWavHeader, QuotaExceededError, summarizeText } from './services/geminiService';
@@ -19,8 +21,13 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-// Set up PDF.js worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+// Set up PDF.js worker from the bundled copy. Loading it from a public CDN
+// would let that CDN (or anyone who compromises it) run arbitrary script in
+// this origin, and would break if the CDN is unreachable.
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
+
+/** Largest PDF we will read into memory. */
+const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024;
 
 interface PageData {
   text: string;
@@ -95,7 +102,15 @@ export default function App() {
 
   const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = event.target.files?.[0];
-    if (selectedFile && selectedFile.type === 'application/pdf') {
+    if (selectedFile && selectedFile.size > MAX_FILE_SIZE_BYTES) {
+      console.error('PDF exceeds the 50MB limit.');
+      return;
+    }
+    if (
+      selectedFile &&
+      selectedFile.type === 'application/pdf' &&
+      selectedFile.name.toLowerCase().endsWith('.pdf')
+    ) {
       setFile(selectedFile);
       setIsProcessing(true);
       setCurrentPage(1);
@@ -104,7 +119,14 @@ export default function App() {
       
       try {
         const arrayBuffer = await selectedFile.arrayBuffer();
-        const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+        const loadingTask = pdfjsLib.getDocument({
+          data: arrayBuffer,
+          // Uploaded PDFs are untrusted: never compile font programs with
+          // eval, never fetch remote resources, and keep XFA out of the parse.
+          isEvalSupported: false,
+          disableAutoFetch: true,
+          enableXfa: false,
+        });
         const pdf = await loadingTask.promise;
         setPdfDoc(pdf);
         setNumPages(pdf.numPages);
